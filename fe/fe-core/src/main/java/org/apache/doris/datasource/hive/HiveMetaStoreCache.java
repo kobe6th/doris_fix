@@ -63,10 +63,12 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.parquet.Strings;
 
+import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.PrivilegedExceptionAction;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -95,11 +97,31 @@ public class HiveMetaStoreCache {
     private LoadingCache<PartitionCacheKey, HivePartition> partitionCache;
     // cache from <location> -> <file list>
     private LoadingCache<FileCacheKey, ImmutableList<InputSplit>> fileCache;
+    // cache for ugi
+    private static final Map<String, UserGroupInformation> UGI_CACHE = new ConcurrentHashMap<>();
 
     public HiveMetaStoreCache(HMSExternalCatalog catalog, Executor executor) {
         this.catalog = catalog;
         init(executor);
         initMetrics();
+    }
+
+    // Use UGI_CACHE since Even if the user passed in is the same, every time
+    // UserGroupInformation.createRemoteUser(user) is called, a different ugi object will be returned,
+    // which will cause the FileSystem.CACHE.Key to identify the FileSystem to be different,
+    // resulting in large number of thread will be created when accessing CHDFS.
+    private static UserGroupInformation getUgi(String user) throws IOException {
+        UserGroupInformation ugi = UGI_CACHE.get(user);
+        if (ugi == null) {
+            synchronized (UGI_CACHE) {
+                ugi = UGI_CACHE.get(user);
+                if (ugi == null) {
+                    ugi = UserGroupInformation.createRemoteUser(user);
+                    UGI_CACHE.put(user, ugi);
+                }
+            }
+        }
+        return ugi;
     }
 
     private void init(Executor executor) {
@@ -273,7 +295,7 @@ public class HiveMetaStoreCache {
                 InputSplit[] splits;
                 String remoteUser = jobConf.get(HdfsResource.HADOOP_USER_NAME);
                 if (!Strings.isNullOrEmpty(remoteUser)) {
-                    UserGroupInformation ugi = UserGroupInformation.createRemoteUser(remoteUser);
+                    UserGroupInformation ugi = getUgi(remoteUser);
                     splits = ugi.doAs(
                             (PrivilegedExceptionAction<InputSplit[]>) () -> inputFormat.getSplits(jobConf, 0));
                 } else {
